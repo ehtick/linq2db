@@ -1,26 +1,29 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Transactions;
+
 using LinqToDB;
+using LinqToDB.AspNet;
 using LinqToDB.Configuration;
 using LinqToDB.Data;
 using LinqToDB.DataProvider;
 using LinqToDB.DataProvider.DB2;
 using LinqToDB.DataProvider.SqlServer;
+using LinqToDB.Data.RetryPolicy;
+using LinqToDB.Mapping;
+
+using Microsoft.Extensions.DependencyInjection;
+
 using NUnit.Framework;
 
 namespace Tests.Data
 {
-	using System.Collections.Generic;
-	using System.Data.Common;
-	using System.Transactions;
-	using LinqToDB.AspNet;
-	using LinqToDB.Data.RetryPolicy;
-	using LinqToDB.Mapping;
-	using Microsoft.Extensions.DependencyInjection;
 	using Model;
 
 	[TestFixture]
@@ -435,7 +438,7 @@ namespace Tests.Data
 						if (cn.State == ConnectionState.Closed)
 							open = true;
 					};
-				conn.OnBeforeConnectionOpenAsync += async (dc, cn, token) => await Task.Run(() => 
+				conn.OnBeforeConnectionOpenAsync += async (dc, cn, token) => await Task.Run(() =>
 						{
 							if (cn.State == ConnectionState.Closed)
 								openAsync = true;

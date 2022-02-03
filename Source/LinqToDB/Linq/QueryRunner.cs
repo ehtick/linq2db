@@ -22,7 +22,7 @@ namespace LinqToDB.Linq
 	using Data;
 	using Extensions;
 	using LinqToDB.Expressions;
-	using LinqToDB.Reflection;
+	using Reflection;
 	using SqlQuery;
 
 	static partial class QueryRunner
@@ -42,7 +42,7 @@ namespace LinqToDB.Linq
 			internal static MemoryCache<IStructuralEquatable> QueryCache { get; } = new (new ());
 		}
 
-#region Mapper
+		#region Mapper
 
 		class Mapper<T>
 		{
@@ -62,7 +62,19 @@ namespace LinqToDB.Linq
 				public bool                                           IsFaulted;
 			}
 
-			public T Map(IDataContext context, IQueryRunner queryRunner, IDataReader dataReader)
+			interface IMappingContext
+			{
+				ReaderMapperInfo MapperInfo { get; set; }
+			}
+
+			public class MappingContext : IMappingContext
+			{
+				public IDataReader               DataReader     = null!;
+				public Type                      DataReaderType = null!;
+				ReaderMapperInfo IMappingContext.MapperInfo { get; set; } = null!;
+			}
+
+			public MappingContext GetMappingContext(IDataContext context, IQueryRunner queryRunner, IDataReader dataReader)
 			{
 				// unwrap early
 				// https://github.com/linq2db/linq2db/issues/2499
@@ -77,9 +89,25 @@ namespace LinqToDB.Linq
 					queryRunner.MapperExpression = mapperExpression;
 
 					var mapper = mapperExpression.CompileExpression();
-					mapperInfo = new ReaderMapperInfo() { MapperExpression = mapperExpression, Mapper = mapper };
+					mapperInfo = new ReaderMapperInfo() {MapperExpression = mapperExpression, Mapper = mapper};
 					_mappers.TryAdd(dataReaderType, mapperInfo);
 				}
+
+				var ctx = new MappingContext
+				{
+					DataReader     = dataReader,
+					DataReaderType = dataReaderType,
+				};
+
+				((IMappingContext)ctx).MapperInfo = mapperInfo;
+
+				return ctx;
+			}
+
+			public T Map(IDataContext context, IQueryRunner queryRunner, MappingContext mappingContext)
+			{
+				var dataReader = mappingContext.DataReader;
+				var mapperInfo = ((IMappingContext)mappingContext).MapperInfo;
 
 				try
 				{
@@ -101,7 +129,8 @@ namespace LinqToDB.Linq
 
 					queryRunner.MapperExpression = mapperInfo.MapperExpression;
 
-					var expression = TransformMapperExpression(context, dataReader, dataReaderType, true);
+					var dataReaderType = mappingContext.DataReaderType;
+					var expression     = TransformMapperExpression(context, dataReader, dataReaderType, true);
 
 					// create new instance to avoid race conditions without locks
 					var expr   = mapperInfo.MapperExpression;
@@ -198,9 +227,9 @@ namespace LinqToDB.Linq
 			}
 		}
 
-#endregion
+		#endregion
 
-#region Helpers
+		#region Helpers
 
 		static void FinalizeQuery(Query query)
 		{
@@ -321,9 +350,9 @@ namespace LinqToDB.Linq
 			//=> obj.GetType();
 			=> db.MappingSchema.GetEntityDescriptor(typeof(T)).InheritanceMapping?.Count > 0 ? obj!.GetType() : typeof(T);
 
-#endregion
+		#endregion
 
-#region SetRunQuery
+		#region SetRunQuery
 
 		public delegate int TakeSkipDelegate(
 			Query                    query,
@@ -380,11 +409,17 @@ namespace LinqToDB.Linq
 			using (var runner = dataContext.GetQueryRunner(query, queryNumber, expression, ps, preambles))
 			using (var dr     = runner.ExecuteReader())
 			{
-				while (dr.Read())
+				if (dr.Read())
 				{
-					var value = mapper.Map(dataContext, runner, dr);
-					runner.RowsCount++;
-					yield return value;
+					var ctx = mapper.GetMappingContext(dataContext, runner, dr);
+
+					do
+					{
+						var value = mapper.Map(dataContext, runner, ctx);
+						runner.RowsCount++;
+						yield return value;
+					}
+					while (dr.Read());
 				}
 			}
 		}
@@ -423,11 +458,17 @@ namespace LinqToDB.Linq
 
 					var take = takeAction?.Invoke(query, expression, dataContext, ps) ?? int.MaxValue;
 
-					while (take-- > 0 && await dr.ReadAsync(cancellationToken).ConfigureAwait(Configuration.ContinueOnCapturedContext))
+					if (take-- > 0 && await dr.ReadAsync(cancellationToken).ConfigureAwait(Configuration.ContinueOnCapturedContext))
 					{
-						runner.RowsCount++;
-						if (!func(mapper.Map(dataContext, runner, dr.DataReader)))
-							break;
+						var ctx = mapper.GetMappingContext(dataContext, runner, dr.DataReader);
+
+						do
+						{
+							runner.RowsCount++;
+							if (!func(mapper.Map(dataContext, runner, ctx)))
+								break;
+						}
+						while (take-- > 0 && await dr.ReadAsync(cancellationToken).ConfigureAwait(Configuration.ContinueOnCapturedContext));
 					}
 				}
 			}
@@ -446,9 +487,10 @@ namespace LinqToDB.Linq
 			readonly TakeSkipDelegate? _takeAction;
 			readonly CancellationToken _cancellationToken;
 
-			IQueryRunner?     _queryRunner;
-			IDataReaderAsync? _dataReader;
-			int              _take;
+			IQueryRunner?             _queryRunner;
+			IDataReaderAsync?         _dataReader;
+			int                       _take;
+			Mapper<T>.MappingContext? _mapperContext;
 
 			public AsyncEnumeratorImpl(
 				Query             query,
@@ -503,7 +545,9 @@ namespace LinqToDB.Linq
 				{
 					_queryRunner.RowsCount++;
 
-					Current = _mapper.Map(_dataContext, _queryRunner, _dataReader.DataReader);
+					_mapperContext ??= _mapper.GetMappingContext(_dataContext, _queryRunner, _dataReader.DataReader);
+
+					Current = _mapper.Map(_dataContext, _queryRunner, _mapperContext);
 
 					return true;
 				}
@@ -528,7 +572,7 @@ namespace LinqToDB.Linq
 				if (_queryRunner != null)
 					await _queryRunner.DisposeAsync().ConfigureAwait(Configuration.ContinueOnCapturedContext);
 
-				if (_dataReader != null) 
+				if (_dataReader != null)
 					await _dataReader.DisposeAsync().ConfigureAwait(Configuration.ContinueOnCapturedContext);
 
 				_queryRunner = null;
@@ -655,9 +699,9 @@ namespace LinqToDB.Linq
 					dataReaderParam);
 		}
 
-#endregion
+		#endregion
 
-#region SetRunQuery / Cast, Concat, Union, OfType, ScalarSelect, Select, SequenceContext, Table
+		#region SetRunQuery / Cast, Concat, Union, OfType, ScalarSelect, Select, SequenceContext, Table
 
 		public static void SetRunQuery<T>(
 			Query<T> query,
@@ -668,9 +712,9 @@ namespace LinqToDB.Linq
 			SetRunQuery(query, l);
 		}
 
-#endregion
+		#endregion
 
-#region SetRunQuery / Select 2
+		#region SetRunQuery / Select 2
 
 		public static void SetRunQuery<T>(
 			Query<T> query,
@@ -711,9 +755,9 @@ namespace LinqToDB.Linq
 			SetRunQuery(query, l);
 		}
 
-#endregion
+		#endregion
 
-#region SetRunQuery / Aggregation, All, Any, Contains, Count
+		#region SetRunQuery / Aggregation, All, Any, Contains, Count
 
 		public static void SetRunQuery<T>(
 			Query<T> query,
@@ -747,7 +791,8 @@ namespace LinqToDB.Linq
 				{
 					if (dr.Read())
 					{
-						var value = mapper.Map(dataContext, runner, dr);
+						var ctx   = mapper.GetMappingContext(dataContext, runner, dr);
+						var value = mapper.Map(dataContext, runner, ctx);
 						runner.RowsCount++;
 						return value;
 					}
@@ -784,7 +829,8 @@ namespace LinqToDB.Linq
 					{
 						runner.RowsCount++;
 
-						var item = mapper.Map(dataContext, runner, dr.DataReader);
+						var ctx  = mapper.GetMappingContext(dataContext, runner, dr.DataReader);
+						var item = mapper.Map(dataContext, runner, ctx);
 
 						return dataContext.MappingSchema.ChangeTypeTo<T>(item);
 					}
@@ -794,9 +840,9 @@ namespace LinqToDB.Linq
 			}
 		}
 
-#endregion
+		#endregion
 
-#region ScalarQuery
+		#region ScalarQuery
 
 		public static void SetScalarQuery(Query query)
 		{
@@ -834,9 +880,9 @@ namespace LinqToDB.Linq
 				return await runner.ExecuteScalarAsync(cancellationToken).ConfigureAwait(Configuration.ContinueOnCapturedContext);
 		}
 
-#endregion
+		#endregion
 
-#region NonQueryQuery
+		#region NonQueryQuery
 
 		public static void SetNonQueryQuery(Query query)
 		{
@@ -874,9 +920,9 @@ namespace LinqToDB.Linq
 				return await runner.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(Configuration.ContinueOnCapturedContext);
 		}
 
-#endregion
+		#endregion
 
-#region NonQueryQuery2
+		#region NonQueryQuery2
 
 		public static void SetNonQueryQuery2(Query query)
 		{
@@ -932,9 +978,9 @@ namespace LinqToDB.Linq
 			}
 		}
 
-#endregion
+		#endregion
 
-#region QueryQuery2
+		#region QueryQuery2
 
 		public static void SetQueryQuery2(Query query)
 		{
@@ -990,9 +1036,9 @@ namespace LinqToDB.Linq
 			}
 		}
 
-#endregion
+		#endregion
 
-#region GetSqlText
+		#region GetSqlText
 
 		public static string GetSqlText(Query query, IDataContext dataContext, Expression expr, object?[]? parameters, object?[]? preambles)
 		{
@@ -1000,6 +1046,6 @@ namespace LinqToDB.Linq
 				return runner.GetSqlText();
 		}
 
-#endregion
+		#endregion
 	}
 }
